@@ -602,4 +602,70 @@ class PubSubRestIntegrationTest {
                 .statusCode(200)
                 .body("permissions", empty());
     }
+
+    @Test
+    void seekToTimeDropsOlderMessagesAndBadTimeIsRejected() {
+        String project = "pubsub-rest-seek-it";
+        String topic = "seek-events";
+        String subscription = "seek-events-sub";
+        String base = "/v1/projects/" + project;
+
+        given().when().put(base + "/topics/" + topic).then().statusCode(200);
+
+        given()
+                .contentType("application/json")
+                .body("{\"topic\": \"projects/%s/topics/%s\"}".formatted(project, topic))
+                .when().put(base + "/subscriptions/" + subscription)
+                .then()
+                .statusCode(200);
+
+        String oldPayload = Base64.getEncoder().encodeToString("old".getBytes());
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"messages\": [{\"data\": \"%s\"}]}".formatted(oldPayload))
+                .when().post(base + "/topics/" + topic + ":publish")
+                .then()
+                .statusCode(200);
+
+        // Seek to a far-future time: every message published before it is treated as acknowledged
+        // and dropped, so only messages published after the seek remain pullable.
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"time\": \"2099-01-01T00:00:00Z\"}")
+                .when().post(base + "/subscriptions/" + subscription + ":seek")
+                .then()
+                .statusCode(200)
+                .body("$", anEmptyMap());
+
+        String newPayload = Base64.getEncoder().encodeToString("new".getBytes());
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"messages\": [{\"data\": \"%s\"}]}".formatted(newPayload))
+                .when().post(base + "/topics/" + topic + ":publish")
+                .then()
+                .statusCode(200);
+
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"maxMessages\": 10}")
+                .when().post(base + "/subscriptions/" + subscription + ":pull")
+                .then()
+                .statusCode(200)
+                .body("receivedMessages.size()", equalTo(1))
+                .body("receivedMessages[0].message.data", equalTo(newPayload));
+
+        // A malformed seek time is rejected with 400 INVALID_ARGUMENT, like the other routes
+        // map their errors.
+        given()
+                .urlEncodingEnabled(false)
+                .contentType("application/json")
+                .body("{\"time\": \"not-a-valid-time\"}")
+                .when().post(base + "/subscriptions/" + subscription + ":seek")
+                .then()
+                .statusCode(400);
+    }
 }

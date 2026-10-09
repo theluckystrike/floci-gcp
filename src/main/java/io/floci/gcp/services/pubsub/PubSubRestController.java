@@ -1,6 +1,7 @@
 package io.floci.gcp.services.pubsub;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Timestamp;
 import com.google.pubsub.v1.PubsubMessage;
 import com.google.pubsub.v1.ReceivedMessage;
 import io.floci.gcp.core.common.GcpException;
@@ -26,6 +27,8 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -229,6 +232,16 @@ public class PubSubRestController {
                                 @PathParam("subscription") String subscriptionId,
                                 Map<String, Object> body) {
         service.acknowledge(subscriptionName(project, subscriptionId), stringList(body, "ackIds"));
+        return Response.ok(Map.of()).build();
+    }
+
+    @POST
+    @Path("/subscriptions/{subscription}:seek")
+    public Response seek(@PathParam("project") String project,
+                         @PathParam("subscription") String subscriptionId,
+                         Map<String, Object> body) {
+        String snapshot = stringValue(body, "snapshot");
+        service.seek(subscriptionName(project, subscriptionId), snapshot, seekTime(body));
         return Response.ok(Map.of()).build();
     }
 
@@ -518,6 +531,22 @@ public class PubSubRestController {
     private static String stringValue(Map<?, ?> body, String key) {
         Object value = value(body, key);
         return value == null ? null : value.toString();
+    }
+
+    private static Timestamp seekTime(Map<String, Object> body) {
+        String time = stringValue(body, "time");
+        if (time == null || time.isBlank()) {
+            return null;
+        }
+        try {
+            Instant instant = Instant.parse(time);
+            return Timestamp.newBuilder()
+                    .setSeconds(instant.getEpochSecond())
+                    .setNanos(instant.getNano())
+                    .build();
+        } catch (DateTimeParseException e) {
+            throw GcpException.invalidArgument("Invalid seek time: " + time);
+        }
     }
 
     private static int intValue(Map<String, Object> body, String key) {
