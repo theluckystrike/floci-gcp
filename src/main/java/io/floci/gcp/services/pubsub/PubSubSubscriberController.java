@@ -12,6 +12,7 @@ import io.grpc.stub.StreamObserver;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -153,8 +154,15 @@ public class PubSubSubscriberController extends SubscriberGrpc.SubscriberImplBas
     public void modifyAckDeadline(ModifyAckDeadlineRequest request, StreamObserver<Empty> responseObserver) {
         LOG.debugf("modifyAckDeadline subscription=%s ackIds=%d deadline=%d",
                 request.getSubscription(), request.getAckIdsCount(), request.getAckDeadlineSeconds());
-        responseObserver.onNext(Empty.getDefaultInstance());
-        responseObserver.onCompleted();
+        try {
+            service.modifyAckDeadline(request.getSubscription(), request.getAckIdsList(),
+                    request.getAckDeadlineSeconds());
+            responseObserver.onNext(Empty.getDefaultInstance());
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            LOG.warnf("modifyAckDeadline failed: %s", e.getMessage());
+            GcpGrpcController.grpcError(responseObserver, e);
+        }
     }
 
     @Override
@@ -189,6 +197,23 @@ public class PubSubSubscriberController extends SubscriberGrpc.SubscriberImplBas
                     if (!request.getAckIdsList().isEmpty()) {
                         LOG.debugf("streamingPull ack subscription=%s ackIds=%d", sub, request.getAckIdsCount());
                         service.acknowledge(sub, request.getAckIdsList());
+                    }
+                    if (!request.getModifyDeadlineAckIdsList().isEmpty()) {
+                        LOG.debugf("streamingPull modifyDeadline subscription=%s ackIds=%d",
+                                sub, request.getModifyDeadlineAckIdsCount());
+                        // modify_deadline_seconds pairs with modify_deadline_ack_ids by index.
+                        List<String> nacked = new ArrayList<>();
+                        for (int i = 0; i < request.getModifyDeadlineAckIdsCount(); i++) {
+                            int deadline = i < request.getModifyDeadlineSecondsCount()
+                                    ? request.getModifyDeadlineSeconds(i)
+                                    : 0;
+                            if (deadline == 0) {
+                                nacked.add(request.getModifyDeadlineAckIds(i));
+                            }
+                        }
+                        if (!nacked.isEmpty()) {
+                            service.modifyAckDeadline(sub, nacked, 0);
+                        }
                     }
                     deliverStreamingMessages(sub, responseObserver, closed, deliveryLock);
                 } catch (Exception e) {

@@ -1,7 +1,9 @@
 package io.floci.gcp.services.pubsub;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Empty;
 import com.google.protobuf.Timestamp;
+import com.google.pubsub.v1.ModifyAckDeadlineRequest;
 import com.google.pubsub.v1.PubsubMessage;
 import com.google.pubsub.v1.SeekRequest;
 import com.google.pubsub.v1.SeekResponse;
@@ -167,6 +169,98 @@ class PubSubSubscriberControllerTest {
         assertNull(responseObserver.error.get());
         assertEquals(1, responseObserver.values.size());
         assertTrue(service.pull(subscription, 10).isEmpty(), "a message published before the seek time is acknowledged");
+    }
+
+    @Test
+    void modifyAckDeadlineOverGrpcWithZeroRequeuesMessage() {
+        String topic = "projects/p1/topics/t1";
+        String subscription = "projects/p1/subscriptions/s1";
+        service.createTopic(topic);
+        service.createSubscription(subscription, topic, 10);
+        service.publish(topic, List.of(PubsubMessage.newBuilder()
+                .setData(ByteString.copyFromUtf8("nack-me"))
+                .build()));
+
+        List<com.google.pubsub.v1.ReceivedMessage> first = service.pull(subscription, 10);
+        assertEquals(1, first.size());
+
+        RecordingObserver<Empty> responseObserver = new RecordingObserver<>();
+        controller.modifyAckDeadline(ModifyAckDeadlineRequest.newBuilder()
+                .setSubscription(subscription)
+                .addAckIds(first.get(0).getAckId())
+                .setAckDeadlineSeconds(0)
+                .build(), responseObserver);
+
+        assertNull(responseObserver.error.get());
+        assertEquals(1, responseObserver.values.size());
+
+        List<com.google.pubsub.v1.ReceivedMessage> second = service.pull(subscription, 10);
+        assertEquals(1, second.size());
+        assertEquals("nack-me", second.get(0).getMessage().getData().toStringUtf8());
+    }
+
+    @Test
+    void streamingPullModifyDeadlineRequeuesMessage() throws Exception {
+        String topic = "projects/p1/topics/t1";
+        String subscription = "projects/p1/subscriptions/s1";
+        service.createTopic(topic);
+        service.createSubscription(subscription, topic, 10);
+        service.publish(topic, List.of(PubsubMessage.newBuilder()
+                .setData(ByteString.copyFromUtf8("nack-stream"))
+                .build()));
+
+        List<com.google.pubsub.v1.ReceivedMessage> first = service.pull(subscription, 10);
+        assertEquals(1, first.size());
+
+        RecordingObserver<StreamingPullResponse> responseObserver = new RecordingObserver<>();
+        StreamObserver<StreamingPullRequest> requestObserver = controller.streamingPull(responseObserver);
+        requestObserver.onNext(StreamingPullRequest.newBuilder()
+                .setSubscription(subscription)
+                .addModifyDeadlineAckIds(first.get(0).getAckId())
+                .addModifyDeadlineSeconds(0)
+                .build());
+
+        assertTrue(responseObserver.awaitValue(),
+                "streaming pull should redeliver the nacked message");
+        assertNull(responseObserver.error.get());
+        StreamingPullResponse response = responseObserver.values.get(0);
+        assertEquals(1, response.getReceivedMessagesCount());
+        assertEquals("nack-stream", response.getReceivedMessages(0).getMessage().getData().toStringUtf8());
+
+        requestObserver.onCompleted();
+    }
+
+    @Test
+    void streamingPullModifyDeadlinePairsEachAckIdWithItsOwnDeadline() throws Exception {
+        String topic = "projects/p1/topics/t1";
+        String subscription = "projects/p1/subscriptions/s1";
+        service.createTopic(topic);
+        service.createSubscription(subscription, topic, 10);
+        service.publish(topic, List.of(
+                PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("keep-leased")).build(),
+                PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("nack-me")).build()));
+
+        List<com.google.pubsub.v1.ReceivedMessage> first = service.pull(subscription, 10);
+        assertEquals(2, first.size());
+
+        RecordingObserver<StreamingPullResponse> responseObserver = new RecordingObserver<>();
+        StreamObserver<StreamingPullRequest> requestObserver = controller.streamingPull(responseObserver);
+        requestObserver.onNext(StreamingPullRequest.newBuilder()
+                .setSubscription(subscription)
+                .addModifyDeadlineAckIds(first.get(0).getAckId())
+                .addModifyDeadlineSeconds(60)
+                .addModifyDeadlineAckIds(first.get(1).getAckId())
+                .addModifyDeadlineSeconds(0)
+                .build());
+
+        assertTrue(responseObserver.awaitValue(),
+                "streaming pull should redeliver the nacked message");
+        assertNull(responseObserver.error.get());
+        StreamingPullResponse response = responseObserver.values.get(0);
+        assertEquals(1, response.getReceivedMessagesCount());
+        assertEquals("nack-me", response.getReceivedMessages(0).getMessage().getData().toStringUtf8());
+
+        requestObserver.onCompleted();
     }
 
     @Test

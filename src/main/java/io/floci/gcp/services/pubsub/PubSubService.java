@@ -652,6 +652,40 @@ public class PubSubService {
         }
     }
 
+    public void modifyAckDeadline(String subName, List<String> ackIds, int ackDeadlineSeconds) {
+        LOG.debugf("modifyAckDeadline subscription=%s ackIds=%d deadline=%d",
+                subName, ackIds.size(), ackDeadlineSeconds);
+        getSubscription(subName);
+        ConcurrentHashMap<String, StoredMessage> deliveredMap = delivered.get(subName);
+        if (deliveredMap == null) {
+            LOG.warnf("modifyAckDeadline: no delivered map for subscription=%s", subName);
+            return;
+        }
+        if (ackDeadlineSeconds != 0) {
+            // A non-zero deadline just extends the lease; the message stays delivered.
+            return;
+        }
+        // ackDeadlineSeconds == 0 nacks the message: move it back to the front of the
+        // subscription queue so the next pull returns it, in publish order.
+        ConcurrentLinkedDeque<StoredMessage> queue =
+                queues.computeIfAbsent(subName, k -> new ConcurrentLinkedDeque<>());
+        List<StoredMessage> requeued = new ArrayList<>();
+        for (String ackId : ackIds) {
+            StoredMessage msg = deliveredMap.remove(ackId);
+            if (msg != null) {
+                requeued.add(msg);
+            }
+        }
+        if (requeued.isEmpty()) {
+            return;
+        }
+        requeued.sort(PUBLISH_ORDER);
+        for (int i = requeued.size() - 1; i >= 0; i--) {
+            queue.addFirst(requeued.get(i));
+        }
+        notifyListeners(subName);
+    }
+
     Runnable registerMessageListener(String subName, MessageListener listener) {
         getSubscription(subName);
         CopyOnWriteArrayList<MessageListener> subscriptionListeners =

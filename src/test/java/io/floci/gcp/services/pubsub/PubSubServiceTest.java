@@ -480,6 +480,102 @@ class PubSubServiceTest {
         List<ReceivedMessage> second = service.pull("projects/p1/subscriptions/s1", 10);
         assertTrue(second.isEmpty());
     }
+    @Test
+    void modifyAckDeadlineWithZeroRequeuesMessageToFront() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("nack-me")).build()));
+
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, first.size());
+        assertEquals("nack-me", first.get(0).getMessage().getData().toStringUtf8());
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1",
+                List.of(first.get(0).getAckId()), 0);
+
+        List<ReceivedMessage> second = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, second.size());
+        assertEquals("nack-me", second.get(0).getMessage().getData().toStringUtf8());
+        assertNotEquals(first.get(0).getAckId(), second.get(0).getAckId());
+    }
+
+    @Test
+    void modifyAckDeadlineWithNonZeroKeepsMessageLeased() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("leased")).build()));
+
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, first.size());
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1",
+                List.of(first.get(0).getAckId()), 30);
+
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty(),
+                "a non-zero deadline keeps the message leased and out of the queue");
+    }
+
+    @Test
+    void modifyAckDeadlineWithZeroRequeuesOnlyNamedMessages() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1", List.of(
+                PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("a")).build(),
+                PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("b")).build()));
+
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(2, first.size());
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1",
+                List.of(first.get(0).getAckId()), 0);
+
+        List<ReceivedMessage> second = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, second.size());
+        assertEquals(first.get(0).getMessage().getData().toStringUtf8(),
+                second.get(0).getMessage().getData().toStringUtf8());
+    }
+
+    @Test
+    void modifyAckDeadlineWithZeroRequeuesInPublishOrder() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        List<PubsubMessage> batch = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            batch.add(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("o" + i)).build());
+        }
+        service.publish("projects/p1/topics/t1", batch);
+
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(4, first.size());
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1",
+                first.stream().map(ReceivedMessage::getAckId).toList(), 0);
+
+        List<String> redelivered = service.pull("projects/p1/subscriptions/s1", 10).stream()
+                .map(m -> m.getMessage().getData().toStringUtf8())
+                .toList();
+        assertEquals(List.of("o0", "o1", "o2", "o3"), redelivered);
+    }
+
+    @Test
+    void modifyAckDeadlineWithZeroWakesStreamingListeners() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("m")).build()));
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 10);
+        AtomicInteger wakeups = new AtomicInteger();
+        Runnable unregister = service.registerMessageListener("projects/p1/subscriptions/s1", wakeups::incrementAndGet);
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1",
+                List.of(first.get(0).getAckId()), 0);
+
+        assertEquals(1, wakeups.get());
+        unregister.run();
+    }
+
 
     // ── IAM policies ───────────────────────────────────────────────────────────
 
