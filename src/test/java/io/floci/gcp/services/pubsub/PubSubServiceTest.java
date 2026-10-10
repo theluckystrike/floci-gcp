@@ -21,7 +21,9 @@ import org.junit.jupiter.api.BeforeEach;
 
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -39,16 +41,29 @@ class PubSubServiceTest {
     private PubSubService service;
     private IamService iamService;
     private InMemoryStorage<String, StoredSubscription> subStore;
+    private MutableClock clock;
 
     @BeforeEach
     void setUp() {
         subStore = new InMemoryStorage<>();
         iamService = IamServices.inMemory();
+        clock = new MutableClock(Instant.parse("2026-10-10T00:00:00Z"));
         service = new PubSubService(
                 new InMemoryStorage<>(),
                 subStore,
                 new InMemoryStorage<>(),
-                iamService);
+                iamService,
+                clock);
+    }
+
+    /** A Clock whose instant can be advanced in tests, so lease expiry is deterministic. */
+    static final class MutableClock extends Clock {
+        private volatile Instant now;
+        MutableClock(Instant now) { this.now = now; }
+        void advance(java.time.Duration d) { now = now.plus(d); }
+        @Override public Instant instant() { return now; }
+        @Override public java.time.ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(java.time.ZoneId zone) { return this; }
     }
 
     @AfterEach
@@ -575,6 +590,93 @@ class PubSubServiceTest {
         assertEquals(1, wakeups.get());
         unregister.run();
     }
+
+    @Test
+    void expiredLeaseIsRedeliveredOnNextPull() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("expire-me")).build()));
+
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, first.size());
+
+        // Before the ack deadline the message stays leased.
+        clock.advance(java.time.Duration.ofSeconds(5));
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty(),
+                "message is still leased before the ack deadline");
+
+        // After the ack deadline the lease expires and the next pull redelivers it.
+        clock.advance(java.time.Duration.ofSeconds(6));
+        List<ReceivedMessage> second = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, second.size());
+        assertEquals("expire-me", second.get(0).getMessage().getData().toStringUtf8());
+        assertNotEquals(first.get(0).getAckId(), second.get(0).getAckId(),
+                "redelivery gets a fresh ack id");
+    }
+
+    @Test
+    void modifyAckDeadlineWithNonZeroExtendsLease() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("extended")).build()));
+
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, first.size());
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1",
+                List.of(first.get(0).getAckId()), 30);
+
+        // Past the original 10s deadline but before the extended 30s deadline: still leased.
+        clock.advance(java.time.Duration.ofSeconds(15));
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty(),
+                "extended lease keeps the message out of the queue");
+
+        // Past the extended deadline: redelivered.
+        clock.advance(java.time.Duration.ofSeconds(20));
+        List<ReceivedMessage> second = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, second.size());
+        assertEquals("extended", second.get(0).getMessage().getData().toStringUtf8());
+    }
+
+    @Test
+    void expiredLeasesRedeliveredInPublishOrder() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        List<PubsubMessage> batch = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            batch.add(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("e" + i)).build());
+        }
+        service.publish("projects/p1/topics/t1", batch);
+
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(4, first.size());
+
+        clock.advance(java.time.Duration.ofSeconds(11));
+        List<String> redelivered = service.pull("projects/p1/subscriptions/s1", 10).stream()
+                .map(m -> m.getMessage().getData().toStringUtf8())
+                .toList();
+        assertEquals(List.of("e0", "e1", "e2", "e3"), redelivered);
+    }
+
+    @Test
+    void acknowledgedMessageIsNotRedeliveredAfterExpiry() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("acked")).build()));
+
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, first.size());
+
+        service.acknowledge("projects/p1/subscriptions/s1", List.of(first.get(0).getAckId()));
+
+        clock.advance(java.time.Duration.ofSeconds(20));
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty(),
+                "an acknowledged message is not redelivered after the deadline");
+    }
+
 
 
     // ── IAM policies ───────────────────────────────────────────────────────────

@@ -31,6 +31,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
@@ -67,6 +68,7 @@ public class PubSubService {
 
     private final ConcurrentHashMap<String, ConcurrentLinkedDeque<StoredMessage>> queues = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, StoredMessage>> delivered = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Instant>> deliveredExpiry = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CopyOnWriteArrayList<MessageListener>> listeners = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Predicate<Map<String, String>>> compiledFilters = new ConcurrentHashMap<>();
     private final AtomicLong messageIdCounter = new AtomicLong(0);
@@ -78,6 +80,7 @@ public class PubSubService {
     private final HttpClient httpClient;
     private final ExecutorService pushDeliveryExecutor;
     private final ScheduledExecutorService pushRetryExecutor;
+    private final Clock clock;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     @Inject
@@ -95,6 +98,7 @@ public class PubSubService {
                 .build();
         this.pushDeliveryExecutor = Executors.newCachedThreadPool();
         this.pushRetryExecutor = Executors.newScheduledThreadPool(1);
+        this.clock = Clock.systemUTC();
         this.topicStore = storageFactory.createGlobal("pubsub-topics", "pubsub-topics.json",
                 new TypeReference<Map<String, StoredTopic>>() {});
         this.subStore = storageFactory.createGlobal("pubsub-subs", "pubsub-subs.json",
@@ -119,6 +123,28 @@ public class PubSubService {
         this.serviceRegistry = null;
         this.config = null;
         this.grpcServerManager = null;
+        this.clock = Clock.systemUTC();
+        registerPolicyResolvers();
+    }
+
+    PubSubService(StorageBackend<String, StoredTopic> topicStore,
+            StorageBackend<String, StoredSubscription> subStore,
+            StorageBackend<String, StoredSnapshot> snapshotStore,
+            IamService iamService,
+            Clock clock) {
+        this.topicStore = topicStore;
+        this.subStore = subStore;
+        this.snapshotStore = snapshotStore;
+        this.iamService = iamService;
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+        this.pushDeliveryExecutor = Executors.newCachedThreadPool();
+        this.pushRetryExecutor = Executors.newScheduledThreadPool(1);
+        this.serviceRegistry = null;
+        this.config = null;
+        this.grpcServerManager = null;
+        this.clock = clock;
         registerPolicyResolvers();
     }
 
@@ -278,6 +304,7 @@ public class PubSubService {
         subStore.put(name, sub);
         queues.put(name, new ConcurrentLinkedDeque<>());
         delivered.put(name, new ConcurrentHashMap<>());
+        deliveredExpiry.put(name, new ConcurrentHashMap<>());
         listeners.put(name, new CopyOnWriteArrayList<>());
         return sub;
     }
@@ -420,6 +447,7 @@ public class PubSubService {
         iamService.deleteResourceAndPolicy(name, () -> subStore.delete(name));
         queues.remove(name);
         delivered.remove(name);
+        deliveredExpiry.remove(name);
         listeners.remove(name);
     }
 
@@ -431,6 +459,7 @@ public class PubSubService {
         subStore.put(name, sub);
         queues.remove(name);
         delivered.remove(name);
+        deliveredExpiry.remove(name);
         listeners.remove(name);
     }
 
@@ -607,6 +636,10 @@ public class PubSubService {
         ConcurrentLinkedDeque<StoredMessage> queue = queues.computeIfAbsent(subName, k -> new ConcurrentLinkedDeque<>());
         ConcurrentHashMap<String, StoredMessage> deliveredMap = delivered.computeIfAbsent(subName, k -> new ConcurrentHashMap<>());
 
+        // First move any expired leases back to the front of the queue so the next
+        // pull returns them, in publish order.
+        requeueExpired(subName, queue, deliveredMap);
+
         List<ReceivedMessage> result = new ArrayList<>();
         int count = 0;
         while (count < maxMessages) {
@@ -615,6 +648,7 @@ public class PubSubService {
 
             String ackId = UUID.randomUUID().toString();
             deliveredMap.put(ackId, msg);
+            recordExpiry(subName, ackId);
 
             PubsubMessage.Builder msgBuilder = PubsubMessage.newBuilder()
                     .setMessageId(msg.getMessageId())
@@ -647,8 +681,12 @@ public class PubSubService {
             LOG.warnf("acknowledge: no delivered map for subscription=%s", subName);
             return;
         }
+        ConcurrentHashMap<String, Instant> expiryMap = deliveredExpiry.get(subName);
         for (String ackId : ackIds) {
             deliveredMap.remove(ackId);
+            if (expiryMap != null) {
+                expiryMap.remove(ackId);
+            }
         }
     }
 
@@ -661,8 +699,15 @@ public class PubSubService {
             LOG.warnf("modifyAckDeadline: no delivered map for subscription=%s", subName);
             return;
         }
+        ConcurrentHashMap<String, Instant> expiryMap = deliveredExpiry.get(subName);
         if (ackDeadlineSeconds != 0) {
-            // A non-zero deadline just extends the lease; the message stays delivered.
+            // A non-zero deadline extends the lease: move the expiry to now plus the new value.
+            Instant newExpiry = clock.instant().plus(ackDeadlineSeconds, java.time.temporal.ChronoUnit.SECONDS);
+            for (String ackId : ackIds) {
+                if (deliveredMap.containsKey(ackId) && expiryMap != null) {
+                    expiryMap.put(ackId, newExpiry);
+                }
+            }
             return;
         }
         // ackDeadlineSeconds == 0 nacks the message: move it back to the front of the
@@ -672,8 +717,47 @@ public class PubSubService {
         List<StoredMessage> requeued = new ArrayList<>();
         for (String ackId : ackIds) {
             StoredMessage msg = deliveredMap.remove(ackId);
+            if (expiryMap != null) {
+                expiryMap.remove(ackId);
+            }
             if (msg != null) {
                 requeued.add(msg);
+            }
+        }
+        if (requeued.isEmpty()) {
+            return;
+        }
+        requeued.sort(PUBLISH_ORDER);
+        for (int i = requeued.size() - 1; i >= 0; i--) {
+            queue.addFirst(requeued.get(i));
+        }
+        notifyListeners(subName);
+    }
+
+    private void recordExpiry(String subName, String ackId) {
+        StoredSubscription sub = subStore.get(subName).orElse(null);
+        int deadline = sub != null ? sub.getAckDeadlineSeconds() : 10;
+        Instant expiry = clock.instant().plus(deadline, java.time.temporal.ChronoUnit.SECONDS);
+        deliveredExpiry.computeIfAbsent(subName, k -> new ConcurrentHashMap<>()).put(ackId, expiry);
+    }
+
+    private void requeueExpired(String subName,
+            ConcurrentLinkedDeque<StoredMessage> queue,
+            ConcurrentHashMap<String, StoredMessage> deliveredMap) {
+        ConcurrentHashMap<String, Instant> expiryMap = deliveredExpiry.get(subName);
+        if (expiryMap == null || expiryMap.isEmpty()) {
+            return;
+        }
+        Instant now = clock.instant();
+        List<StoredMessage> requeued = new ArrayList<>();
+        for (String ackId : List.copyOf(expiryMap.keySet())) {
+            Instant expiry = expiryMap.get(ackId);
+            if (expiry != null && !expiry.isAfter(now)) {
+                StoredMessage msg = deliveredMap.remove(ackId);
+                expiryMap.remove(ackId);
+                if (msg != null) {
+                    requeued.add(msg);
+                }
             }
         }
         if (requeued.isEmpty()) {
@@ -784,6 +868,10 @@ public class PubSubService {
             if (deliveredMap != null) {
                 deliveredMap.clear();
             }
+            ConcurrentHashMap<String, Instant> expiryMap = deliveredExpiry.get(subscriptionName);
+            if (expiryMap != null) {
+                expiryMap.clear();
+            }
             return;
         }
         // Seek to a time: messages published before it count as acknowledged and are dropped,
@@ -794,8 +882,12 @@ public class PubSubService {
         queue.removeIf(msg -> isBefore(msg.getPublishTime(), seekTime));
         if (deliveredMap != null) {
             List<StoredMessage> requeued = new ArrayList<>();
+            ConcurrentHashMap<String, Instant> expiryMap = deliveredExpiry.get(subscriptionName);
             for (String ackId : List.copyOf(deliveredMap.keySet())) {
                 StoredMessage msg = deliveredMap.remove(ackId);
+                if (expiryMap != null) {
+                    expiryMap.remove(ackId);
+                }
                 if (msg != null && !isBefore(msg.getPublishTime(), seekTime)) {
                     requeued.add(msg);
                 }
